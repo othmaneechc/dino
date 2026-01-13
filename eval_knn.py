@@ -140,12 +140,36 @@ def extract_features(model, data_loader, use_cuda=True, multiscale=False):
 
 
 @torch.no_grad()
-def knn_classifier(train_features, train_labels, test_features, test_labels, k, T, num_classes=1000):
+def _update_confusion_matrix(confusion, preds, targets, num_classes):
+    preds = preds.view(-1).to(torch.int64)
+    targets = targets.view(-1).to(torch.int64)
+    if preds.is_cuda:
+        preds = preds.cpu()
+    if targets.is_cuda:
+        targets = targets.cpu()
+    indices = targets * num_classes + preds
+    counts = torch.bincount(indices, minlength=num_classes * num_classes)
+    confusion += counts.view(num_classes, num_classes)
+
+
+def knn_classifier(
+    train_features,
+    train_labels,
+    test_features,
+    test_labels,
+    k,
+    T,
+    num_classes=1000,
+    return_confusion=False,
+):
     top1, top5, total = 0.0, 0.0, 0
     train_features = train_features.t()
     num_test_images, num_chunks = test_labels.shape[0], 100
     imgs_per_chunk = num_test_images // num_chunks
     retrieval_one_hot = torch.zeros(k, num_classes).to(train_features.device)
+    confusion = None
+    if return_confusion:
+        confusion = torch.zeros(num_classes, num_classes, dtype=torch.int64)
     for idx in range(0, num_test_images, imgs_per_chunk):
         # get the features for test images
         features = test_features[
@@ -177,8 +201,12 @@ def knn_classifier(train_features, train_labels, test_features, test_labels, k, 
         top1 = top1 + correct.narrow(1, 0, 1).sum().item()
         top5 = top5 + correct.narrow(1, 0, min(5, k)).sum().item()  # top5 does not make sense if k < 5
         total += targets.size(0)
+        if confusion is not None:
+            _update_confusion_matrix(confusion, predictions[:, 0], targets, num_classes)
     top1 = top1 * 100.0 / total
     top5 = top5 * 100.0 / total
+    if confusion is not None:
+        return top1, top5, confusion
     return top1, top5
 
 
@@ -206,6 +234,8 @@ if __name__ == '__main__':
         help='Path where to save computed features, empty for no saving')
     parser.add_argument('--load_features', default=None, help="""If the features have
         already been computed, where to find them.""")
+    parser.add_argument('--confusion_matrix_dir', default=None,
+        help='Directory to save confusion matrices. Defaults to dump_features, load_features, or CWD.')
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
@@ -235,8 +265,28 @@ if __name__ == '__main__':
             test_labels = test_labels.cuda()
 
         print("Features are ready!\nStart the k-NN classification.")
+        num_classes = int(train_labels.max().item()) + 1
+        confusion_dir = args.confusion_matrix_dir
+        if confusion_dir is None:
+            confusion_dir = args.dump_features or args.load_features or os.getcwd()
+        os.makedirs(confusion_dir, exist_ok=True)
         for k in args.nb_knn:
-            top1, top5 = knn_classifier(train_features, train_labels,
-                test_features, test_labels, k, args.temperature)
+            top1, top5, confusion = knn_classifier(
+                train_features,
+                train_labels,
+                test_features,
+                test_labels,
+                k,
+                args.temperature,
+                num_classes=num_classes,
+                return_confusion=True,
+            )
             print(f"{k}-NN classifier result: Top1: {top1}, Top5: {top5}")
+            cm_path = os.path.join(confusion_dir, f"confusion_k{k}.txt")
+            with open(cm_path, "w") as f:
+                f.write(f"Split: val, k={k}\n")
+                f.write("Confusion matrix (rows=true, cols=pred):\n")
+                for row in confusion.tolist():
+                    f.write(" ".join(str(int(x)) for x in row) + "\n")
+            print(f"Saved confusion matrix to {cm_path}")
     dist.barrier()
