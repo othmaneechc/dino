@@ -199,7 +199,8 @@ def knn_classifier(
         # find the predictions that match the target
         correct = predictions.eq(targets.data.view(-1, 1))
         top1 = top1 + correct.narrow(1, 0, 1).sum().item()
-        top5 = top5 + correct.narrow(1, 0, min(5, k)).sum().item()  # top5 does not make sense if k < 5
+        top5_k = min(5, predictions.size(1))
+        top5 = top5 + correct.narrow(1, 0, top5_k).sum().item()
         total += targets.size(0)
         if confusion is not None:
             _update_confusion_matrix(confusion, predictions[:, 0], targets, num_classes)
